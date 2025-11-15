@@ -119,27 +119,51 @@ class SessionManager:
 SESSION_MANAGER = SessionManager()
 
 # ===================== EMBEDDINGS + FAISS (RAG) =====================
-EMB_DIM = None
-try:
-    from fastembed import TextEmbedding
-    _EMB = TextEmbedding(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-    def embed(texts: List[str]) -> List[List[float]]:
-        return [e for e in _EMB.embed(texts, batch_size=64)]
-    EMB_DIM = len(embed(["hola"])[0])
-except Exception:
-    from sentence_transformers import SentenceTransformer
-    _EMB = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", cache_folder="./.hf-cache")
-    def embed(texts: List[str]) -> List[List[float]]:
-        v = _EMB.encode(texts, normalize_embeddings=True)
-        return v.tolist() if hasattr(v, "tolist") else v
-    EMB_DIM = len(embed(["hola"])[0])
+# ===================== EMBEDDINGS (ligero vía API) =====================
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "togethercomputer/m2-bert-80M-8k-retrieval"  # puedes cambiarlo por el que uses
+)
+
+EMB_DIM = None  # la definimos después del primer llamado
+
+def embed(texts: List[str]) -> List[List[float]]:
+    """Obtiene embeddings ligeros vía Together.ai para no cargar modelos locales."""
+    global EMB_DIM
+
+    if not TOGETHER_API_KEY:
+        raise RuntimeError("TOGETHER_API_KEY está vacío y se necesitan embeddings para el RAG.")
+
+    url = "https://api.together.xyz/v1/embeddings"
+    headers = {"Authorization": f"Bearer {TOGETHER_API_KEY}"}
+    payload = {
+        "model": EMBEDDING_MODEL,
+        "input": texts,
+    }
+
+    r = httpx.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+
+    if not data:
+        raise RuntimeError("La API de embeddings no devolvió resultados.")
+
+    vectors = [item["embedding"] for item in data]
+
+    # Inicializamos EMB_DIM la primera vez
+    if EMB_DIM is None:
+        dim = len(vectors[0])
+        print(f"[emb] Dimensión de embedding detectada: {dim}")
+        globals()["EMB_DIM"] = dim
+
+    return vectors
 
 import faiss
 import numpy as np
 from pathlib import Path
 from pypdf import PdfReader
 
-INDEX = faiss.IndexFlatIP(EMB_DIM)
+INDEX = None
 VEC_IDS: List[str] = []
 CHUNK_MAP: Dict[str, Dict[str, Any]] = {}
 
@@ -173,6 +197,16 @@ BASE_FACTS = {
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 # ===================== HELPERS =====================
+
+def get_index() -> faiss.IndexFlatIP:
+    global INDEX, EMB_DIM
+    if INDEX is None:
+        if EMB_DIM is None:
+            # Forzamos un embedding mínimo para conocer la dimensión
+            _ = embed(["hola"])
+        INDEX = faiss.IndexFlatIP(EMB_DIM)
+    return INDEX
+
 def pesos(n: float) -> str:
     return f"${n:,.0f} MXN"
 
@@ -198,7 +232,7 @@ def load_pdf_text(path: Path) -> str:
 
 def reset_index():
     global INDEX, VEC_IDS, CHUNK_MAP
-    INDEX = faiss.IndexFlatIP(EMB_DIM)
+    INDEX = None
     VEC_IDS = []
     CHUNK_MAP = {}
 
@@ -523,11 +557,19 @@ def is_negative_response(text: str) -> bool:
 
 # ===================== BÚSQUEDA Y RAG =====================
 def search(query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
-    if len(VEC_IDS) == 0 or INDEX.ntotal == 0:
+    # Si no hay vectores, no hay nada que buscar
+    if len(VEC_IDS) == 0:
         return []
+
+    # Aseguramos tener índice
+    idx = get_index()
+    if idx.ntotal == 0:
+        return []
+
     Q = np.array(embed([query]), dtype=np.float32)
     faiss.normalize_L2(Q)
-    D, I = INDEX.search(Q, top_k)
+    D, I = idx.search(Q, top_k)
+
     hits = []
     for i, score in zip(I[0], D[0]):
         if i == -1:
@@ -536,7 +578,7 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
         meta = CHUNK_MAP.get(vec_id, {})
         meta = {**meta, "score": float(score), "id": vec_id}
         hits.append(meta)
-    
+
     # Filtrar y ordenar
     seen = set()
     filtered = []
@@ -548,7 +590,7 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
         if h.get("kind") == "qna":
             h["score"] += 0.2
         filtered.append(h)
-    
+
     return sorted(filtered, key=lambda x: x["score"], reverse=True)[:top_k]
 
 def rerank(query: str, hits: List[Dict[str, Any]], top_n: int = 6) -> List[Dict[str, Any]]:
@@ -613,28 +655,44 @@ def find_best_qna_matches(user_text: str, hits: List[Dict[str, Any]], max_matche
 
 # ===================== INDEXACIÓN =====================
 def add_to_index(doc_id: str, title: str, text: str):
-    """Añade documento al índice"""
+    """Añade documento al índice usando embeddings vía API y un índice FAISS perezoso."""
+    # Aseguramos que el índice exista
+    idx = get_index()
+
     qna_chunks = parse_qna_chunks(text)
     if qna_chunks:
         vecs = embed(qna_chunks)
-        X = np.array(vecs, dtype=np.float32); faiss.normalize_L2(X)
-        INDEX.add(X)
+        X = np.array(vecs, dtype=np.float32)
+        faiss.normalize_L2(X)
+        idx.add(X)
         for j, c in enumerate(qna_chunks):
             vec_id = f"{doc_id}::qna::{j}"
             VEC_IDS.append(vec_id)
-            CHUNK_MAP[vec_id] = {"doc_id": doc_id, "title": title, "text": c, "kind": "qna"}
+            CHUNK_MAP[vec_id] = {
+                "doc_id": doc_id,
+                "title": title,
+                "text": c,
+                "kind": "qna",
+            }
         return
 
     chunks = chunk_text(text)
     if not chunks:
         return
+
     vecs = embed(chunks)
-    X = np.array(vecs, dtype=np.float32); faiss.normalize_L2(X)
-    INDEX.add(X)
+    X = np.array(vecs, dtype=np.float32)
+    faiss.normalize_L2(X)
+    idx.add(X)
     for j, c in enumerate(chunks):
         vec_id = f"{doc_id}::{j}"
         VEC_IDS.append(vec_id)
-        CHUNK_MAP[vec_id] = {"doc_id": doc_id, "title": title, "text": c, "kind": "raw"}
+        CHUNK_MAP[vec_id] = {
+            "doc_id": doc_id,
+            "title": title,
+            "text": c,
+            "kind": "raw",
+        }
 
 def parse_qna_chunks(raw: str) -> List[str]:
     """Extrae Q/A del texto"""
@@ -975,10 +1033,15 @@ async def admin_reindex():
 
 @app.get("/admin/stats")
 async def admin_stats():
+    # Si nunca se ha usado el índice, INDEX puede ser None
+    index_size = 0
+    if INDEX is not None:
+        index_size = int(INDEX.ntotal)
+
     return {
         "docs": len(set(v.split("::")[0] for v in VEC_IDS)),
         "chunks": len(VEC_IDS),
-        "index_size": int(INDEX.ntotal),
+        "index_size": index_size,
         "emb_dim": EMB_DIM,
         "ctx_window": CTX_WINDOW,
         "use_together": USE_TOGETHER,
@@ -1000,7 +1063,7 @@ def send_text_psid(psid: str, text: str):
 @app.on_event("startup")
 async def on_startup():
     load_llm()
-    load_reranker()
+#    load_reranker()
     pdf_dir = Path("./pdfs")
     pdf_dir.mkdir(exist_ok=True)
     if any(pdf_dir.glob("**/*.pdf")):
