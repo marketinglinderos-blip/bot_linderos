@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+requests
+httpx
+numpy
+faiss-cpu
+pypdf
+llama-cpp-python
+sentence-transformers
+fastembed
+regex
