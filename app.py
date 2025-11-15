@@ -31,7 +31,6 @@ if USE_TOGETHER and not TOGETHER_API_KEY:
     print("[WARN] USE_TOGETHER=true pero TOGETHER_API_KEY está vacío. Las llamadas a Together van a fallar.")
 
 # ===================== LLM =====================
-from llama_cpp import Llama  # pip install llama-cpp-python
 LLM = None  # type: ignore
 
 def load_llm():
