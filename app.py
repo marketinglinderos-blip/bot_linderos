@@ -23,7 +23,7 @@ TOP_CTX = int(os.getenv("TOP_CTX", "6"))
 # Alternar a Together.ai sin tocar el código
 # Alternar a Together.ai sin tocar el código
 USE_TOGETHER = os.getenv("USE_TOGETHER", "true").lower() == "true"
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "a2b3a10dd0c63010b73d07d5a10be3ac8c994434a34ed95cefe5096ffa87cfdd")
 TOGETHER_MODEL = os.getenv("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo")
 
 # (Opcional pero recomendable)
@@ -122,41 +122,81 @@ SESSION_MANAGER = SessionManager()
 # ===================== EMBEDDINGS (ligero vía API) =====================
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
-    "togethercomputer/m2-bert-80M-8k-retrieval"  # puedes cambiarlo por el que uses
+    "intfloat/multilingual-e5-large-instruct"  # Modelo más confiable y rápido
 )
 
 EMB_DIM = None  # la definimos después del primer llamado
 
-def embed(texts: List[str]) -> List[List[float]]:
-    """Obtiene embeddings ligeros vía Together.ai para no cargar modelos locales."""
+import time
+import httpx
+from typing import List
+
+def embed(texts: List[str], max_retries: int = 5) -> List[List[float]]:
+    """Embeddings con backoff exponencial y manejo robusto de errores"""
     global EMB_DIM
 
     if not TOGETHER_API_KEY:
-        raise RuntimeError("TOGETHER_API_KEY está vacío y se necesitan embeddings para el RAG.")
+        raise RuntimeError("TOGETHER_API_KEY está vacío")
 
     url = "https://api.together.xyz/v1/embeddings"
-    headers = {"Authorization": f"Bearer {TOGETHER_API_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "User-Agent": "LinderosBot/1.0"
+    }
     payload = {
         "model": EMBEDDING_MODEL,
         "input": texts,
     }
 
-    r = httpx.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", [])
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Backoff exponencial: 2, 4, 8, 16, 32 segundos
+            wait_time = 2 ** attempt
+            if attempt > 0:
+                print(f"[emb] Reintento {attempt}/{max_retries} en {wait_time}s...")
+                time.sleep(wait_time)
 
-    if not data:
-        raise RuntimeError("La API de embeddings no devolvió resultados.")
+            with httpx.Client(timeout=60.0) as client:
+                r = client.post(url, headers=headers, json=payload)
+                r.raise_for_status()
+                
+                data = r.json().get("data", [])
+                if not data:
+                    raise RuntimeError("API no devolvió datos")
 
-    vectors = [item["embedding"] for item in data]
+                vectors = [item["embedding"] for item in data]
 
-    # Inicializamos EMB_DIM la primera vez
-    if EMB_DIM is None:
-        dim = len(vectors[0])
-        print(f"[emb] Dimensión de embedding detectada: {dim}")
-        globals()["EMB_DIM"] = dim
+                if EMB_DIM is None:
+                    EMB_DIM = len(vectors[0])
+                    print(f"[emb] Dimensión: {EMB_DIM}")
 
-    return vectors
+                return vectors
+
+        except httpx.HTTPStatusError as e:
+            last_exception = e
+            if e.response.status_code in [503, 429, 500]:  # Servicio no disponible, rate limit, error interno
+                print(f"[emb] Error HTTP {e.response.status_code}, reintentando...")
+                continue
+            else:
+                print(f"[emb] Error HTTP permanente {e.response.status_code}")
+                break
+                
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            last_exception = e
+            print(f"[emb] Error de conexión, reintentando...")
+            continue
+            
+        except Exception as e:
+            last_exception = e
+            print(f"[emb] Error inesperado: {e}")
+            break
+
+    # Si llegamos aquí, todos los reintentos fallaron
+    error_msg = f"Falló después de {max_retries} intentos: {last_exception}"
+    print(f"[emb] {error_msg}")
+    raise RuntimeError(error_msg)
 
 import faiss
 import numpy as np
@@ -557,41 +597,61 @@ def is_negative_response(text: str) -> bool:
 
 # ===================== BÚSQUEDA Y RAG =====================
 def search(query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
+    print(f"[search] Buscando: '{query}'")
+    print(f"[search] VEC_IDS disponibles: {len(VEC_IDS)}")
+    
     # Si no hay vectores, no hay nada que buscar
     if len(VEC_IDS) == 0:
+        print("[search] ❌ No hay vectores indexados")
         return []
 
     # Aseguramos tener índice
     idx = get_index()
     if idx.ntotal == 0:
+        print("[search] ❌ Índice FAISS vacío")
         return []
 
-    Q = np.array(embed([query]), dtype=np.float32)
-    faiss.normalize_L2(Q)
-    D, I = idx.search(Q, top_k)
+    print(f"[search] Índice FAISS tiene {idx.ntotal} vectores")
+    
+    try:
+        Q = np.array(embed([query]), dtype=np.float32)
+        faiss.normalize_L2(Q)
+        D, I = idx.search(Q, top_k)
+        print(f"[search] Búsqueda FAISS completada, resultados: {len(I[0])}")
+        
+        hits = []
+        for i, score in zip(I[0], D[0]):
+            if i == -1:
+                continue
+            vec_id = VEC_IDS[i]
+            meta = CHUNK_MAP.get(vec_id, {})
+            meta = {**meta, "score": float(score), "id": vec_id}
+            hits.append(meta)
 
-    hits = []
-    for i, score in zip(I[0], D[0]):
-        if i == -1:
-            continue
-        vec_id = VEC_IDS[i]
-        meta = CHUNK_MAP.get(vec_id, {})
-        meta = {**meta, "score": float(score), "id": vec_id}
-        hits.append(meta)
+        # Filtrar y ordenar
+        seen = set()
+        filtered = []
+        for h in hits:
+            key = h.get("text", "")[:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            if h.get("kind") == "qna":
+                h["score"] += 0.2
+            filtered.append(h)
 
-    # Filtrar y ordenar
-    seen = set()
-    filtered = []
-    for h in hits:
-        key = h.get("text", "")[:80]
-        if key in seen:
-            continue
-        seen.add(key)
-        if h.get("kind") == "qna":
-            h["score"] += 0.2
-        filtered.append(h)
-
-    return sorted(filtered, key=lambda x: x["score"], reverse=True)[:top_k]
+        result = sorted(filtered, key=lambda x: x["score"], reverse=True)[:top_k]
+        print(f"[search] Resultados filtrados: {len(result)}")
+        
+        # Mostrar los top 3 resultados
+        for i, hit in enumerate(result[:3]):
+            print(f"[search] Top {i+1}: score={hit['score']:.3f}, text={hit['text'][:100]}...")
+            
+        return result
+        
+    except Exception as e:
+        print(f"[search] ERROR en búsqueda: {e}")
+        return []
 
 def rerank(query: str, hits: List[Dict[str, Any]], top_n: int = 6) -> List[Dict[str, Any]]:
     if not hits or RERANKER is None:
@@ -892,6 +952,17 @@ def process_normal_flow(user_text: str, session_id: str, ask_followup: bool = Tr
     # Buscar información relevante
     raw_hits = search(user_text, top_k=TOP_K)
     reranked_hits = rerank(user_text, raw_hits, top_n=TOP_CTX)
+
+    # PARCHE TEMPORAL - Buscar match por keywords específicos
+    user_lower = user_text.lower()
+    if any(kw in user_lower for kw in ["oficina", "horario", "sucursal", "física"]):
+        for hit in reranked_hits:
+            if "oficina" in hit.get("text", "").lower():
+                # Forzar este hit al top
+                reranked_hits.remove(hit)
+                reranked_hits.insert(0, hit)
+                print(f"🔍✅ OFICINA DETECTADA - Hit movido al top")
+                break
     
     # Encontrar mejores matches Q/A
     qna_matches = find_best_qna_matches(user_text, reranked_hits, max_matches=3)
@@ -1008,13 +1079,36 @@ async def dev_chat(payload: dict, request: Request):
 # ===================== ADMIN ENDPOINTS =====================
 @app.post("/admin/upload")
 async def admin_upload(file: UploadFile = File(...)):
-    pdf_dir = Path("./pdfs"); pdf_dir.mkdir(exist_ok=True)
-    path = pdf_dir / file.filename
-    with open(path, "wb") as f:
-        f.write(await file.read())
-    text = load_pdf_text(path)
-    add_to_index(doc_id=path.stem, title=file.filename, text=text)
-    return {"status": "ok", "docs": len(set(v.split("::")[0] for v in VEC_IDS)), "chunks": len(VEC_IDS)}
+    try:
+        pdf_dir = Path("./pdfs")
+        pdf_dir.mkdir(exist_ok=True)
+
+        path = pdf_dir / file.filename
+        print(f"[admin_upload] Recibido archivo: {file.filename}")
+        with open(path, "wb") as f:
+            content = await file.read()
+            print(f"[admin_upload] Bytes recibidos: {len(content)}")
+            f.write(content)
+
+        print(f"[admin_upload] Leyendo PDF desde: {path}")
+        text = load_pdf_text(path)
+        print(f"[admin_upload] Texto extraído, longitud: {len(text)}")
+
+        add_to_index(doc_id=path.stem, title=file.filename, text=text)
+        print(f"[admin_upload] Index actualizado. Chunks totales: {len(VEC_IDS)}")
+
+        return {
+            "status": "ok",
+            "docs": len(set(v.split("::")[0] for v in VEC_IDS)),
+            "chunks": len(VEC_IDS),
+        }
+
+    except Exception as e:
+        import traceback
+        print("[admin_upload] ERROR:", repr(e))
+        traceback.print_exc()
+        # Deja que FastAPI responda 500, pero ya tendrás el stacktrace en consola
+        raise
 
 @app.post("/admin/reindex")
 async def admin_reindex():
